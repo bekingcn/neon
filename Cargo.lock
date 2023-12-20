@@ -1637,6 +1637,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "desim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "hex",
+ "parking_lot 0.12.1",
+ "rand 0.8.5",
+ "scopeguard",
+ "smallvec",
+ "tracing",
+ "utils",
+ "workspace_hack",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4643,6 +4659,7 @@ dependencies = [
  "clap",
  "const_format",
  "crc32c",
+ "desim",
  "fail",
  "fs2",
  "futures",
@@ -4670,7 +4687,6 @@ dependencies = [
  "serde_with",
  "sha2",
  "signal-hook",
- "slowsim",
  "storage_broker",
  "thiserror",
  "tokio",
@@ -5103,22 +5119,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6528351c9bc8ab22353f9d776db39a20288e8d6c37ef8cfe3317cf875eecfc2d"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "slowsim"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "hex",
- "parking_lot 0.12.1",
- "rand 0.8.5",
- "scopeguard",
- "smallvec",
- "tracing",
- "utils",
- "workspace_hack",
 ]
 
 [[package]]
