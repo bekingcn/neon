@@ -2022,7 +2022,7 @@ class NeonAttachmentService:
     def tenant_shard_split(self, tenant_id: TenantId, shard_count: int) -> list[TenantShardId]:
         response = self.request(
             "PUT",
-            f"{self.env.control_plane_api}/tenant/{tenant_id}/shard_split",
+            f"{self.env.control_plane_api}/control/v1/tenant/{tenant_id}/shard_split",
             json={"new_shard_count": shard_count},
         )
         response.raise_for_status()
@@ -3981,7 +3981,7 @@ def logical_replication_sync(subscriber: VanillaPostgres, publisher: Endpoint) -
 
 
 def tenant_get_shards(
-    env: NeonEnv, tenant_id: TenantId, pageserver_id: Optional[int]
+    env: NeonEnv, tenant_id: TenantId, pageserver_id: Optional[int] = None
 ) -> list[tuple[TenantShardId, NeonPageserver]]:
     """
     Helper for when you want to talk to one or more pageservers, and the
