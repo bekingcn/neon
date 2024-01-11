@@ -835,7 +835,7 @@ pub fn handle_extension_anon(
                         }
                     }
                     Err(e) => {
-                        error!(
+                        warn!(
                             "anon extension is_installed check failed with expected error: {}",
                             e
                         );
@@ -844,7 +844,16 @@ pub fn handle_extension_anon(
 
                 // Create anon extension if this compute needs it
                 // Users cannot create it themselves, because superuser is required.
-                let mut query = "CREATE EXTENSION IF NOT EXISTS anon CASCADE";
+                let mut query = "CREATE EXTENSION IF NOT EXISTS pgcrypto";
+                info!("creating anon extension with query: {}", query);
+                match client.query(query, &[]) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("anon extension creation failed with error: {}", e);
+                        return Ok(());
+                    }
+                }
+                query = "CREATE EXTENSION IF NOT EXISTS anon";
                 info!("creating anon extension with query: {}", query);
                 match client.query(query, &[]) {
                     Ok(_) => {}
@@ -865,8 +874,13 @@ pub fn handle_extension_anon(
                 // Initialize anon extension
                 // This also requires superuser privileges, so users cannot do it themselves.
                 query = "SELECT anon.init()";
-                error!("anon extension is not installed");
-                client.simple_query(query)?;
+                match client.query(query, &[]) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("anon.init() failed with error: {}", e);
+                        return Ok(());
+                    }
+                }
             }
 
             // check that extension is installed, if not bail early
