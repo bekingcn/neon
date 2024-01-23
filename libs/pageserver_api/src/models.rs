@@ -689,21 +689,21 @@ impl TryFrom<u8> for PagestreamBeMessageTag {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PagestreamExistsRequest {
-    pub latest: bool,
+    pub horizon: Lsn,
     pub lsn: Lsn,
     pub rel: RelTag,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PagestreamNblocksRequest {
-    pub latest: bool,
+    pub horizon: Lsn,
     pub lsn: Lsn,
     pub rel: RelTag,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PagestreamGetPageRequest {
-    pub latest: bool,
+    pub horizon: Lsn,
     pub lsn: Lsn,
     pub rel: RelTag,
     pub blkno: u32,
@@ -711,7 +711,7 @@ pub struct PagestreamGetPageRequest {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PagestreamDbSizeRequest {
-    pub latest: bool,
+    pub horizon: Lsn,
     pub lsn: Lsn,
     pub dbnode: u32,
 }
@@ -772,7 +772,7 @@ impl PagestreamFeMessage {
         match self {
             Self::Exists(req) => {
                 bytes.put_u8(0);
-                bytes.put_u8(u8::from(req.latest));
+                bytes.put_u64(req.horizon.0);
                 bytes.put_u64(req.lsn.0);
                 bytes.put_u32(req.rel.spcnode);
                 bytes.put_u32(req.rel.dbnode);
@@ -782,7 +782,7 @@ impl PagestreamFeMessage {
 
             Self::Nblocks(req) => {
                 bytes.put_u8(1);
-                bytes.put_u8(u8::from(req.latest));
+                bytes.put_u64(req.horizon.0);
                 bytes.put_u64(req.lsn.0);
                 bytes.put_u32(req.rel.spcnode);
                 bytes.put_u32(req.rel.dbnode);
@@ -792,7 +792,7 @@ impl PagestreamFeMessage {
 
             Self::GetPage(req) => {
                 bytes.put_u8(2);
-                bytes.put_u8(u8::from(req.latest));
+                bytes.put_u64(req.horizon.0);
                 bytes.put_u64(req.lsn.0);
                 bytes.put_u32(req.rel.spcnode);
                 bytes.put_u32(req.rel.dbnode);
@@ -803,7 +803,7 @@ impl PagestreamFeMessage {
 
             Self::DbSize(req) => {
                 bytes.put_u8(3);
-                bytes.put_u8(u8::from(req.latest));
+                bytes.put_u64(req.horizon.0);
                 bytes.put_u64(req.lsn.0);
                 bytes.put_u32(req.dbnode);
             }
@@ -830,7 +830,7 @@ impl PagestreamFeMessage {
         let msg_tag = body.read_u8()?;
         match msg_tag {
             0 => Ok(PagestreamFeMessage::Exists(PagestreamExistsRequest {
-                latest: body.read_u8()? != 0,
+                horizon: Lsn::from(body.read_u64::<BigEndian>()?),
                 lsn: Lsn::from(body.read_u64::<BigEndian>()?),
                 rel: RelTag {
                     spcnode: body.read_u32::<BigEndian>()?,
@@ -840,7 +840,7 @@ impl PagestreamFeMessage {
                 },
             })),
             1 => Ok(PagestreamFeMessage::Nblocks(PagestreamNblocksRequest {
-                latest: body.read_u8()? != 0,
+                horizon: Lsn::from(body.read_u64::<BigEndian>()?),
                 lsn: Lsn::from(body.read_u64::<BigEndian>()?),
                 rel: RelTag {
                     spcnode: body.read_u32::<BigEndian>()?,
@@ -850,7 +850,7 @@ impl PagestreamFeMessage {
                 },
             })),
             2 => Ok(PagestreamFeMessage::GetPage(PagestreamGetPageRequest {
-                latest: body.read_u8()? != 0,
+                horizon: Lsn::from(body.read_u64::<BigEndian>()?),
                 lsn: Lsn::from(body.read_u64::<BigEndian>()?),
                 rel: RelTag {
                     spcnode: body.read_u32::<BigEndian>()?,
@@ -861,7 +861,7 @@ impl PagestreamFeMessage {
                 blkno: body.read_u32::<BigEndian>()?,
             })),
             3 => Ok(PagestreamFeMessage::DbSize(PagestreamDbSizeRequest {
-                latest: body.read_u8()? != 0,
+                horizon: Lsn::from(body.read_u64::<BigEndian>()?),
                 lsn: Lsn::from(body.read_u64::<BigEndian>()?),
                 dbnode: body.read_u32::<BigEndian>()?,
             })),
@@ -997,7 +997,7 @@ mod tests {
         // Test serialization/deserialization of PagestreamFeMessage
         let messages = vec![
             PagestreamFeMessage::Exists(PagestreamExistsRequest {
-                latest: true,
+                horizon: Lsn.MAX,
                 lsn: Lsn(4),
                 rel: RelTag {
                     forknum: 1,
@@ -1007,7 +1007,7 @@ mod tests {
                 },
             }),
             PagestreamFeMessage::Nblocks(PagestreamNblocksRequest {
-                latest: false,
+                horizon: Lsn(4),
                 lsn: Lsn(4),
                 rel: RelTag {
                     forknum: 1,
@@ -1017,7 +1017,7 @@ mod tests {
                 },
             }),
             PagestreamFeMessage::GetPage(PagestreamGetPageRequest {
-                latest: true,
+                latest: Lsn.MAX,
                 lsn: Lsn(4),
                 rel: RelTag {
                     forknum: 1,
@@ -1028,7 +1028,7 @@ mod tests {
                 blkno: 7,
             }),
             PagestreamFeMessage::DbSize(PagestreamDbSizeRequest {
-                latest: true,
+                latest: Lsn::MAX,
                 lsn: Lsn(4),
                 dbnode: 7,
             }),
