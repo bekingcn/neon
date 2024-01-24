@@ -428,7 +428,7 @@ fn reassign_owned_objects(spec: &ComputeSpec, connstr: &str, role_name: &PgIdent
 /// atomicity should be enough here due to the order of operations and various checks,
 /// which together provide us idempotency.
 #[instrument(skip_all)]
-pub fn handle_databases(spec: &ComputeSpec, client: &mut Client) -> Result<()> {
+pub fn handle_databases(spec: &ComputeSpec, client: &mut Client, connstr: &str) -> Result<()> {
     let existing_dbs = get_existing_dbs(client)?;
 
     // Print a list of existing Postgres databases (only in debug mode)
@@ -564,7 +564,13 @@ pub fn handle_databases(spec: &ComputeSpec, client: &mut Client) -> Result<()> {
                 client.execute(grant_query.as_str(), &[])?;
 
                 // Create anon extension if this compute needs it
-                handle_extension_anon(spec, client, &db.owner.pg_quote(), false)?;
+                handle_extension_anon(
+                    spec,
+                    &db.name.pg_quote(),
+                    connstr,
+                    &db.owner.pg_quote(),
+                    false,
+                )?;
             }
         };
 
@@ -813,18 +819,23 @@ END $$;
 #[instrument(skip_all)]
 pub fn handle_extension_anon(
     spec: &ComputeSpec,
-    client: &mut Client,
     db_owner: &str,
+    db_name: &str,
+    connstr: &str,
     grants_only: bool,
 ) -> Result<()> {
     info!("handle extension anon");
+
+    let mut conf = Config::from_str(connstr)?;
+    conf.dbname(db_name);
+    let mut db_client = conf.connect(NoTls)?;
 
     if let Some(libs) = spec.cluster.settings.find("shared_preload_libraries") {
         if libs.contains("anon") {
             if !grants_only {
                 // check if extension is already initialized using anon.is_initialized()
                 let query = "SELECT anon.is_initialized()";
-                match client.query(query, &[]) {
+                match db_client.query(query, &[]) {
                     Ok(rows) => {
                         if !rows.is_empty() {
                             let is_initialized: bool = rows[0].get(0);
@@ -846,7 +857,7 @@ pub fn handle_extension_anon(
                 // Users cannot create it themselves, because superuser is required.
                 let mut query = "CREATE EXTENSION IF NOT EXISTS anon CASCADE";
                 info!("creating anon extension with query: {}", query);
-                match client.query(query, &[]) {
+                match db_client.query(query, &[]) {
                     Ok(_) => {}
                     Err(e) => {
                         error!("anon extension creation failed with error: {}", e);
@@ -856,7 +867,7 @@ pub fn handle_extension_anon(
 
                 // check that extension is installed
                 query = "SELECT extname FROM pg_extension WHERE extname = 'anon'";
-                let rows = client.query(query, &[])?;
+                let rows = db_client.query(query, &[])?;
                 if rows.is_empty() {
                     error!("anon extension is not installed");
                     return Ok(());
@@ -865,7 +876,7 @@ pub fn handle_extension_anon(
                 // Initialize anon extension
                 // This also requires superuser privileges, so users cannot do it themselves.
                 query = "SELECT anon.init()";
-                match client.query(query, &[]) {
+                match db_client.query(query, &[]) {
                     Ok(_) => {}
                     Err(e) => {
                         error!("anon.init() failed with error: {}", e);
@@ -876,7 +887,7 @@ pub fn handle_extension_anon(
 
             // check that extension is installed, if not bail early
             let query = "SELECT extname FROM pg_extension WHERE extname = 'anon'";
-            match client.query(query, &[]) {
+            match db_client.query(query, &[]) {
                 Ok(rows) => {
                     if rows.is_empty() {
                         error!("anon extension is not installed");
@@ -891,13 +902,12 @@ pub fn handle_extension_anon(
 
             let query = format!("GRANT ALL ON SCHEMA anon TO {}", db_owner);
             info!("granting anon extension permissions with query: {}", query);
-            client.simple_query(&query)?;
-
+            db_client.simple_query(&query)?;
 
             // Grant permissions to db_owner to use anon extension functions
             let query = format!("GRANT ALL ON ALL FUNCTIONS IN SCHEMA anon TO {}", db_owner);
             info!("granting anon extension permissions with query: {}", query);
-            client.simple_query(&query)?;
+            db_client.simple_query(&query)?;
 
             // This is needed, because some functions are defined as SECURITY DEFINER.
             // In Postgres SECURITY DEFINER functions are executed with the privileges
@@ -912,16 +922,16 @@ pub fn handle_extension_anon(
                 where nsp.nspname = 'anon';", db_owner);
 
             info!("change anon extension functions owner to db owner");
-            client.simple_query(&query)?;
+            db_client.simple_query(&query)?;
 
             //  affects views as well
             let query = format!("GRANT ALL ON ALL TABLES IN SCHEMA anon TO {}", db_owner);
             info!("granting anon extension permissions with query: {}", query);
-            client.simple_query(&query)?;
+            db_client.simple_query(&query)?;
 
             let query = format!("GRANT ALL ON ALL SEQUENCES IN SCHEMA anon TO {}", db_owner);
             info!("granting anon extension permissions with query: {}", query);
-            client.simple_query(&query)?;
+            db_client.simple_query(&query)?;
         }
     }
 
