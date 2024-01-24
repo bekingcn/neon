@@ -844,16 +844,7 @@ pub fn handle_extension_anon(
 
                 // Create anon extension if this compute needs it
                 // Users cannot create it themselves, because superuser is required.
-                let mut query = "CREATE EXTENSION IF NOT EXISTS pgcrypto";
-                info!("creating anon extension with query: {}", query);
-                match client.query(query, &[]) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("anon extension creation failed with error: {}", e);
-                        return Ok(());
-                    }
-                }
-                query = "CREATE EXTENSION IF NOT EXISTS anon";
+                let mut query = "CREATE EXTENSION IF NOT EXISTS anon CASCADE";
                 info!("creating anon extension with query: {}", query);
                 match client.query(query, &[]) {
                     Ok(_) => {}
