@@ -581,7 +581,12 @@ pub fn handle_databases(spec: &ComputeSpec, client: &mut Client) -> Result<()> {
 /// Grant CREATE ON DATABASE to the database owner and do some other alters and grants
 /// to allow users creating trusted extensions and re-creating `public` schema, for example.
 #[instrument(skip_all)]
-pub fn handle_grants(spec: &ComputeSpec, client: &mut Client, connstr: &str) -> Result<()> {
+pub fn handle_grants(
+    spec: &ComputeSpec,
+    client: &mut Client,
+    connstr: &str,
+    enable_anon_extension: bool,
+) -> Result<()> {
     info!("modifying database permissions");
     let existing_dbs = get_existing_dbs(client)?;
 
@@ -680,7 +685,9 @@ pub fn handle_grants(spec: &ComputeSpec, client: &mut Client, connstr: &str) -> 
         db_client.simple_query(&grant_query)?;
 
         // it is important to run this after all grants
-        handle_extension_anon(spec, &db.owner, &mut db_client, false)?;
+        if enable_anon_extension {
+            handle_extension_anon(spec, &db.owner, &mut db_client, false)?;
+        }
     }
 
     Ok(())
