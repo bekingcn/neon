@@ -428,7 +428,7 @@ fn reassign_owned_objects(spec: &ComputeSpec, connstr: &str, role_name: &PgIdent
 /// atomicity should be enough here due to the order of operations and various checks,
 /// which together provide us idempotency.
 #[instrument(skip_all)]
-pub fn handle_databases(spec: &ComputeSpec, client: &mut Client, connstr: &str) -> Result<()> {
+pub fn handle_databases(spec: &ComputeSpec, client: &mut Client) -> Result<()> {
     let existing_dbs = get_existing_dbs(client)?;
 
     // Print a list of existing Postgres databases (only in debug mode)
@@ -562,15 +562,6 @@ pub fn handle_databases(spec: &ComputeSpec, client: &mut Client, connstr: &str) 
                     name.pg_quote()
                 );
                 client.execute(grant_query.as_str(), &[])?;
-
-                // Create anon extension if this compute needs it
-                handle_extension_anon(
-                    spec,
-                    &db.name.pg_quote(),
-                    connstr,
-                    &db.owner.pg_quote(),
-                    false,
-                )?;
             }
         };
 
@@ -687,6 +678,9 @@ pub fn handle_grants(spec: &ComputeSpec, client: &mut Client, connstr: &str) -> 
             inlinify(&grant_query)
         );
         db_client.simple_query(&grant_query)?;
+
+        // it is important to run this after all grants
+        handle_extension_anon(spec, &db.owner, &mut db_client, false)?;
     }
 
     Ok(())
@@ -820,15 +814,10 @@ END $$;
 pub fn handle_extension_anon(
     spec: &ComputeSpec,
     db_owner: &str,
-    db_name: &str,
-    connstr: &str,
+    db_client: &mut Client,
     grants_only: bool,
 ) -> Result<()> {
     info!("handle extension anon");
-
-    let mut conf = Config::from_str(connstr)?;
-    conf.dbname(db_name);
-    let mut db_client = conf.connect(NoTls)?;
 
     if let Some(libs) = spec.cluster.settings.find("shared_preload_libraries") {
         if libs.contains("anon") {

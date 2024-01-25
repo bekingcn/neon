@@ -734,7 +734,7 @@ impl ComputeNode {
         create_neon_superuser(spec, &mut client)?;
         cleanup_instance(&mut client)?;
         handle_roles(spec, &mut client)?;
-        handle_databases(spec, &mut client, connstr.as_str())?;
+        handle_databases(spec, &mut client)?;
         handle_role_deletions(spec, connstr.as_str(), &mut client)?;
         handle_grants(spec, &mut client, connstr.as_str())?;
         handle_extensions(spec, &mut client)?;
@@ -809,7 +809,7 @@ impl ComputeNode {
             client.simple_query("SET neon.forward_ddl = false")?;
             cleanup_instance(&mut client)?;
             handle_roles(&spec, &mut client)?;
-            handle_databases(&spec, &mut client, self.connstr.as_str())?;
+            handle_databases(&spec, &mut client)?;
             handle_role_deletions(&spec, self.connstr.as_str(), &mut client)?;
             handle_grants(&spec, &mut client, self.connstr.as_str())?;
             handle_extensions(&spec, &mut client)?;
