@@ -888,15 +888,23 @@ async fn collect_eviction_candidates(
             .resident_layers
             .sort_unstable_by_key(|layer_info| std::cmp::Reverse(layer_info.last_activity_ts));
 
-        candidates.extend(layer_info.resident_layers.into_iter().map(|candidate| {
-            (
-                // Secondary locations' layers are always considered above the min resident size,
-                // i.e. secondary locations are permitted to be trimmed to zero layers if all
-                // the layers have sufficiently old access times.
-                MinResidentSizePartition::Above,
-                candidate,
-            )
-        }));
+        // this total should probably come from the total heatmap layers
+        let total = layer_info.resident_layers.len();
+
+        candidates.extend(layer_info.resident_layers.into_iter().enumerate().map(
+            |(i, mut candidate)| {
+                // FIXME: if these were calculated by the downloading, the value would always
+                // be correct because it knows when do these change.
+                candidate.relative_last_activity = eviction_order.relative_last_activity(total, i);
+                (
+                    // Secondary locations' layers are always considered above the min resident size,
+                    // i.e. secondary locations are permitted to be trimmed to zero layers if all
+                    // the layers have sufficiently old access times.
+                    MinResidentSizePartition::Above,
+                    candidate,
+                )
+            },
+        ));
     }
 
     debug_assert!(MinResidentSizePartition::Above < MinResidentSizePartition::Below,
