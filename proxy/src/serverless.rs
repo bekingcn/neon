@@ -225,11 +225,11 @@ async fn request_handler(
 
         ws_connections.spawn(
             async move {
-                let mut ctx = RequestMonitoring::new(session_id, peer_addr, "ws", &config.region);
+                let ctx = RequestMonitoring::new(session_id, peer_addr, "ws", &config.region);
 
                 if let Err(e) = websocket::serve_websocket(
                     config,
-                    &mut ctx,
+                    ctx,
                     websocket,
                     cancel_map,
                     host,
@@ -246,12 +246,12 @@ async fn request_handler(
         // Return the response so the spawned future can continue.
         Ok(response)
     } else if request.uri().path() == "/sql" && request.method() == Method::POST {
-        let mut ctx = RequestMonitoring::new(session_id, peer_addr, "http", &config.region);
+        let ctx = RequestMonitoring::new(session_id, peer_addr, "http", &config.region);
 
         sql_over_http::handle(
             tls,
             &config.http_config,
-            &mut ctx,
+            ctx,
             request,
             sni_hostname,
             conn_pool,

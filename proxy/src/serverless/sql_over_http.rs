@@ -30,6 +30,7 @@ use crate::auth::endpoint_sni;
 use crate::config::HttpConfig;
 use crate::config::TlsConfig;
 use crate::context::RequestMonitoring;
+use crate::error::ReportableError;
 use crate::metrics::NUM_CONNECTION_REQUESTS_GAUGE;
 use crate::proxy::NeonOptions;
 use crate::RoleName;
@@ -173,20 +174,25 @@ fn check_matches(sni_hostname: &str, hostname: &str) -> Result<bool, anyhow::Err
 pub async fn handle(
     tls: &'static TlsConfig,
     config: &'static HttpConfig,
-    ctx: &mut RequestMonitoring,
+    mut ctx: RequestMonitoring,
     request: Request<Body>,
     sni_hostname: Option<String>,
     conn_pool: Arc<GlobalConnPool>,
 ) -> Result<Response<Body>, ApiError> {
     let result = tokio::time::timeout(
         config.request_timeout,
-        handle_inner(tls, config, ctx, request, sni_hostname, conn_pool),
+        handle_inner(tls, config, &mut ctx, request, sni_hostname, conn_pool),
     )
     .await;
     let mut response = match result {
         Ok(r) => match r {
-            Ok(r) => r,
+            Ok(r) => {
+                ctx.set_success();
+                r
+            },
             Err(e) => {
+                // ctx.set_error_kind(e.get_error_type());
+
                 let mut message = format!("{:?}", e);
                 let db_error = e
                     .downcast_ref::<tokio_postgres::Error>()
@@ -262,7 +268,9 @@ pub async fn handle(
                 )?
             }
         },
-        Err(_) => {
+        Err(e) => {
+            ctx.set_error_kind(e.get_error_type());
+
             let message = format!(
                 "HTTP-Connection timed out, execution time exeeded {} seconds",
                 config.request_timeout.as_secs()
@@ -274,6 +282,9 @@ pub async fn handle(
             )?
         }
     };
+
+    ctx.log();
+
     response.headers_mut().insert(
         "Access-Control-Allow-Origin",
         hyper::http::HeaderValue::from_static("*"),
@@ -436,8 +447,6 @@ async fn handle_inner(
             }
         };
 
-    ctx.set_success();
-    ctx.log();
     let metrics = client.metrics();
 
     // how could this possibly fail

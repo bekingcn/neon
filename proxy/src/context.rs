@@ -104,6 +104,10 @@ impl RequestMonitoring {
         self.user = Some(user);
     }
 
+    pub fn set_error_kind(&mut self, error: ErrorKind) {
+        self.error_kind = Some(error);
+    }
+
     pub fn set_success(&mut self) {
         self.success = true;
     }
