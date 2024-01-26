@@ -189,7 +189,7 @@ pub async fn handle(
             Ok(r) => {
                 ctx.set_success();
                 r
-            },
+            }
             Err(e) => {
                 // ctx.set_error_kind(e.get_error_type());
 
