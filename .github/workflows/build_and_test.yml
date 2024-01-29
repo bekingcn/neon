@@ -521,7 +521,7 @@ jobs:
 
   create-test-report:
     needs: [ check-permissions, regress-tests, coverage-report, benchmarks, build-buildtools-image ]
-    if: ${{ !cancelled() && contains(fromJSON('["skipped", "success"]'), needs.check-permissions.result) }} && github.event.action != 'ready_for_review'
+    if: ${{ !cancelled() && contains(fromJSON('["skipped", "success"]'), needs.check-permissions.result) }} || github.event.action != 'ready_for_review'
 
     runs-on: [ self-hosted, gen3, small ]
     container:
@@ -1057,6 +1057,7 @@ jobs:
         run: rm -rf ~/.ecr
 
   trigger-custom-extensions-build-and-wait:
+    if: github.event.action != 'ready_for_review'
     needs: [ check-permissions, tag ]
     runs-on: ubuntu-latest
     steps:
