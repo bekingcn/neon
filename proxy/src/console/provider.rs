@@ -264,13 +264,16 @@ pub trait Api {
     ) -> Result<CachedNodeInfo, errors::WakeComputeError>;
 }
 
-#[derive(Clone)]
+#[non_exhaustive]
 pub enum ConsoleBackend {
     /// Current Cloud API (V2).
     Console(neon::Api),
     /// Local mock of Cloud API (V2).
     #[cfg(feature = "testing")]
     Postgres(mock::Api),
+    /// Internal testing
+    #[cfg(test)]
+    Test(Box<dyn crate::auth::backend::TestBackend>),
 }
 
 #[async_trait]
@@ -285,6 +288,8 @@ impl Api for ConsoleBackend {
             Console(api) => api.get_role_secret(ctx, user_info).await,
             #[cfg(feature = "testing")]
             Postgres(api) => api.get_role_secret(ctx, user_info).await,
+            #[cfg(test)]
+            Test(_) => unreachable!("this function should never be called in the test backend"),
         }
     }
 
@@ -298,6 +303,8 @@ impl Api for ConsoleBackend {
             Console(api) => api.get_allowed_ips(ctx, user_info).await,
             #[cfg(feature = "testing")]
             Postgres(api) => api.get_allowed_ips(ctx, user_info).await,
+            #[cfg(test)]
+            Test(api) => Ok(Cached::new_uncached(Arc::new(api.get_allowed_ips()?))),
         }
     }
 
@@ -312,6 +319,8 @@ impl Api for ConsoleBackend {
             Console(api) => api.wake_compute(ctx, user_info).await,
             #[cfg(feature = "testing")]
             Postgres(api) => api.wake_compute(ctx, user_info).await,
+            #[cfg(test)]
+            Test(api) => api.wake_compute(),
         }
     }
 }
