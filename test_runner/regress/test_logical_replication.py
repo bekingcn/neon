@@ -1,6 +1,6 @@
+import time
 from random import choice
 from string import ascii_lowercase
-import time
 
 import pytest
 from fixtures.log_helper import log
@@ -255,8 +255,6 @@ def test_large_records(neon_simple_env: NeonEnv, vanilla_pg):
 
     env.neon_cli.create_branch("init")
     endpoint = env.endpoints.create_start("init")
-    tenant_id = endpoint.safe_psql("show neon.tenant_id")[0][0]
-    timeline_id = endpoint.safe_psql("show neon.timeline_id")[0][0]
 
     cur = endpoint.connect().cursor()
     cur.execute("CREATE TABLE reptbl(id int, largeval text);")
@@ -282,7 +280,7 @@ def test_large_records(neon_simple_env: NeonEnv, vanilla_pg):
     assert vanilla_pg.safe_psql("select id, largeval from reptbl") == [(1, value)]
 
     # Test delete, and reinsert another value
-    cur.execute(f"DELETE FROM reptbl WHERE id = 1")
+    cur.execute("DELETE FROM reptbl WHERE id = 1")
     cur.execute(f"INSERT INTO reptbl VALUES (2, '{value}')")
     logical_replication_sync(vanilla_pg, endpoint)
     assert vanilla_pg.safe_psql("select id, largeval from reptbl") == [(2, value)]
