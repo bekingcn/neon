@@ -278,10 +278,48 @@ impl TenantState {
 
         // Build the set of pageservers already in use by this tenant, to avoid scheduling
         // more work on the same pageservers we're already using.
-        let mut used_pageservers = self.intent.all_pageservers();
         let mut modified = false;
 
+        // Remove any intent state that should no longer be present
         use PlacementPolicy::*;
+        match self.policy {
+            Single => {
+                if !self.intent.secondary.is_empty() {
+                    self.intent.secondary.clear();
+                    modified = true;
+                }
+            }
+            Double(secondary_count) => {
+                while self.intent.secondary.len() > secondary_count {
+                    // We have no particular preference for one secondary location over another: just
+                    // arbitrarily drop from the end
+                    modified = true;
+                    self.intent.secondary.pop();
+                }
+            }
+            Secondary => {
+                while self.intent.secondary.len() > 1 {
+                    // We have no particular preference for one secondary location over another: just
+                    // arbitrarily drop from the end
+                    modified = true;
+                }
+            }
+            Detached => {
+                if self.intent.attached.is_some() {
+                    self.intent.attached = None;
+                    modified = true;
+                }
+
+                if !self.intent.secondary.is_empty() {
+                    self.intent.secondary.clear();
+                    modified = true;
+                }
+            }
+        }
+
+        // Collect which pageserers we are using, for anti-affinity in scheduling any that we add in the next step
+        let mut used_pageservers = self.intent.all_pageservers();
+
         match self.policy {
             Single => {
                 // Should have exactly one attached, and zero secondaries
@@ -289,10 +327,6 @@ impl TenantState {
                     let node_id = scheduler.schedule_shard(&used_pageservers)?;
                     self.intent.attached = Some(node_id);
                     used_pageservers.push(node_id);
-                    modified = true;
-                }
-                if !self.intent.secondary.is_empty() {
-                    self.intent.secondary.clear();
                     modified = true;
                 }
             }
@@ -312,17 +346,21 @@ impl TenantState {
                     modified = true;
                 }
             }
-            Detached => {
-                // Should have no attached or secondary pageservers
+            Secondary => {
                 if self.intent.attached.is_some() {
                     self.intent.attached = None;
                     modified = true;
                 }
 
-                if !self.intent.secondary.is_empty() {
-                    self.intent.secondary.clear();
+                if self.intent.secondary.is_empty() {
+                    let node_id = scheduler.schedule_shard(&used_pageservers)?;
+                    self.intent.secondary.push(node_id);
+                    used_pageservers.push(node_id);
                     modified = true;
                 }
+            }
+            Detached => {
+                // Never add locations in this mode
             }
         }
 

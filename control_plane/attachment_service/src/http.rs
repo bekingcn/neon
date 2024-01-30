@@ -1,5 +1,6 @@
 use crate::reconciler::ReconcileError;
 use crate::service::{Service, STARTUP_RECONCILE_TIMEOUT};
+use crate::PlacementPolicy;
 use hyper::{Body, Request, Response};
 use hyper::{StatusCode, Uri};
 use pageserver_api::models::{
@@ -113,7 +114,15 @@ async fn handle_tenant_create(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, ApiError> {
     let create_req = json_request::<TenantCreateRequest>(&mut req).await?;
-    json_response(StatusCode::OK, service.tenant_create(create_req).await?)
+
+    // TODO: enable specifying this.  Using Single as a default helps legacy tests to work (they
+    // have no expectation of HA).
+    let placement_policy = PlacementPolicy::Single;
+
+    json_response(
+        StatusCode::OK,
+        service.tenant_create(create_req, placement_policy).await?,
+    )
 }
 
 // For tenant and timeline deletions, which both implement an "initially return 202, then 404 once
@@ -174,6 +183,15 @@ async fn handle_tenant_location_config(
             .tenant_location_config(tenant_id, config_req)
             .await?,
     )
+}
+
+async fn handle_tenant_secondary_download(
+    service: Arc<Service>,
+    req: Request<Body>,
+) -> Result<Response<Body>, ApiError> {
+    let tenant_id: TenantId = parse_request_param(&req, "tenant_id")?;
+    service.tenant_secondary_download(tenant_id).await?;
+    json_response(StatusCode::OK, ())
 }
 
 async fn handle_tenant_delete(
@@ -402,6 +420,9 @@ pub fn make_router(
         })
         .put("/v1/tenant/:tenant_id/location_config", |r| {
             tenant_service_handler(r, handle_tenant_location_config)
+        })
+        .post("/v1/tenant/:tenant_id/secondary/download", |r| {
+            tenant_service_handler(r, handle_tenant_secondary_download)
         })
         // Tenant Shard operations (low level/maintenance)
         .put("/tenant/:tenant_shard_id/migrate", |r| {
