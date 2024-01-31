@@ -60,7 +60,7 @@ use crate::{
     tenant::storage_layer::{
         AsLayerDesc, DeltaLayerWriter, EvictionError, ImageLayerWriter, InMemoryLayer, Layer,
         LayerAccessStatsReset, LayerFileName, ResidentLayer, ValueReconstructResult,
-        ValueReconstructState,
+        ValueReconstructState, ValuesReconstructState,
     },
 };
 use crate::{
@@ -104,10 +104,10 @@ use self::layer_manager::LayerManager;
 use self::logical_size::LogicalSize;
 use self::walreceiver::{WalReceiver, WalReceiverConf};
 
-use super::config::TenantConf;
 use super::remote_timeline_client::index::{IndexLayerMetadata, IndexPart};
 use super::remote_timeline_client::RemoteTimelineClient;
 use super::secondary::heatmap::{HeatMapLayer, HeatMapTimeline};
+use super::{config::TenantConf, storage_layer::ReadableLayer};
 use super::{debug_assert_current_span_has_tenant_and_timeline_id, AttachedTenantConf};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -444,6 +444,14 @@ pub(crate) enum GetVectoredError {
     #[error("Requested at invalid LSN: {0}")]
     InvalidLsn(Lsn),
 
+    #[error("Requested key {0} not found")]
+    MissingKey(Key),
+
+    #[error(transparent)]
+    GetReadyAncestorError(GetReadyAncestorError),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -542,10 +550,14 @@ impl From<GetVectoredError> for CreateImageLayersError {
 impl From<GetReadyAncestorError> for PageReconstructError {
     fn from(e: GetReadyAncestorError) -> Self {
         match e {
-            GetReadyAncestorError::AncestorStopping(tid) => PageReconstructError::AncestorStopping(tid),
-            GetReadyAncestorError::AncestorLsnTimeout(wait_err) => PageReconstructError::AncestorLsnTimeout(wait_err),
+            GetReadyAncestorError::AncestorStopping(tid) => {
+                PageReconstructError::AncestorStopping(tid)
+            }
+            GetReadyAncestorError::AncestorLsnTimeout(wait_err) => {
+                PageReconstructError::AncestorLsnTimeout(wait_err)
+            }
             GetReadyAncestorError::Cancelled => PageReconstructError::Cancelled,
-            GetReadyAncestorError::Other(other) => PageReconstructError::Other(other)
+            GetReadyAncestorError::Other(other) => PageReconstructError::Other(other),
         }
     }
 }
@@ -693,27 +705,41 @@ impl Timeline {
             return Err(GetVectoredError::Oversized(key_count));
         }
 
-        let mut values = BTreeMap::new();
         for range in key_ranges {
             let mut key = range.start;
             while key != range.end {
                 assert!(!self.shard_identity.is_key_disposable(&key));
-
-                let block = self.get(key, lsn, ctx).await;
-
-                if matches!(
-                    block,
-                    Err(PageReconstructError::Cancelled | PageReconstructError::AncestorStopping(_))
-                ) {
-                    return Err(GetVectoredError::Cancelled);
-                }
-
-                values.insert(key, block);
                 key = key.next();
             }
         }
 
-        Ok(values)
+        let mut reconstruct_state = ValuesReconstructState::new();
+        let keyspace = KeySpace {
+            ranges: Vec::from(key_ranges),
+        };
+
+        self.get_vectored_reconstruct_data(keyspace, lsn, &mut reconstruct_state, ctx)
+            .await?;
+
+        let mut results: BTreeMap<Key, Result<Bytes, PageReconstructError>> = BTreeMap::new();
+        for (key, res) in reconstruct_state.keys {
+            match res {
+                Err(err) => {
+                    results.insert(key, Err(err));
+                }
+                Ok(state) => {
+                    let state = ValueReconstructState {
+                        records: state.records,
+                        img: state.img,
+                    };
+
+                    let reconstruct_res = self.reconstruct_value(key, lsn, state).await;
+                    results.insert(key, reconstruct_res);
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Get last or prev record separately. Same as get_last_record_rlsn().last/prev.
@@ -2512,6 +2538,109 @@ impl Timeline {
                 continue 'outer;
             }
         }
+    }
+
+    async fn get_vectored_reconstruct_data(
+        &self,
+        keyspace: KeySpace,
+        request_lsn: Lsn,
+        reconstruct_state: &mut ValuesReconstructState,
+        ctx: &RequestContext,
+    ) -> Result<(), GetVectoredError> {
+        // Start from the current timeline.
+        let mut timeline_owned: Arc<Timeline>;
+        let mut timeline = self;
+
+        let mut unmapped_keyspace = keyspace.clone();
+        let mut cont_lsn = Lsn(request_lsn.0 + 1);
+
+        let mut matching_layers: BTreeMap<ReadableLayer, KeySpace> = BTreeMap::new();
+
+        let initial_keyspace_size = keyspace.total_size();
+        while reconstruct_state.total_keys_done < initial_keyspace_size {
+            if self.cancel.is_cancelled() {
+                return Err(GetVectoredError::Cancelled);
+            }
+
+            // 1. Check if all keys are done and return if true
+            // 2. Split key ranges up to account for gaps left by finished keys
+            // 3. Switch timelines if needed
+            // 4. Find the next layer for each unmapped range. This can be open, frozen or disk
+            // 5. For the latest layer, inspect it and put all the required data in the bag - pop
+            //    the layer from the heap.
+            // 6. Mark the ranges that previously mapped to this layer as unmapped
+            // 7. Go back to 1
+            let keys_done_last_step = reconstruct_state.consume_done_keys();
+            unmapped_keyspace.remove_overlapping_with(&keys_done_last_step);
+
+            if Lsn(cont_lsn.0 - 1) <= timeline.ancestor_lsn {
+                trace!(
+                    "going into ancestor {}, cont_lsn is {}",
+                    timeline.ancestor_lsn,
+                    cont_lsn
+                );
+
+                timeline_owned = self
+                    .get_ready_ancestor_timeline(ctx)
+                    .await
+                    .map_err(GetVectoredError::GetReadyAncestorError)?;
+                timeline = &*timeline_owned;
+            }
+
+            let guard = timeline.layers.read().await;
+            let layers = guard.layer_map();
+
+            let in_memory_layer = layers.iter_in_memory_layers().find(|l| {
+                let start_lsn = l.get_lsn_range().start;
+                cont_lsn > start_lsn
+            });
+
+            match in_memory_layer {
+                Some(l) => {
+                    matching_layers.insert(ReadableLayer::InMemory(l), unmapped_keyspace.clone());
+                }
+                None => {
+                    for range in unmapped_keyspace.ranges.iter() {
+                        let results = layers.range_search(range.clone(), cont_lsn);
+                        if results.is_none() {
+                            return Err(GetVectoredError::InvalidLsn(cont_lsn));
+                        }
+
+                        let results = results.unwrap();
+                        matching_layers.extend(results.found.into_iter().map(|(res, accum)| {
+                            (
+                                ReadableLayer::Persistent {
+                                    layer: guard.get_from_desc(&res.0.layer),
+                                    lsn_floor: res.0.lsn_floor,
+                                },
+                                accum.to_keyspace(),
+                            )
+                        }));
+
+                        let not_found = &results.not_found.to_keyspace();
+                        if let Some(first_missing_key) = not_found.start() {
+                            return Err(GetVectoredError::MissingKey(first_missing_key));
+                        }
+                    }
+                }
+            }
+
+            if let Some((layer_to_read, keyspace_to_read)) = matching_layers.pop_first() {
+                layer_to_read
+                    .get_values_reconstruct_data(
+                        keyspace_to_read.clone(),
+                        cont_lsn,
+                        reconstruct_state,
+                        ctx,
+                    )
+                    .await?;
+
+                unmapped_keyspace = keyspace_to_read;
+                cont_lsn = layer_to_read.get_lsn_floor();
+            }
+        }
+
+        Ok(())
     }
 
     /// # Cancel-safety

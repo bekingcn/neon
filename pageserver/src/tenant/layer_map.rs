@@ -153,7 +153,7 @@ pub struct SearchResult {
     pub lsn_floor: Lsn,
 }
 
-pub struct OrderedSearchResult(SearchResult);
+pub struct OrderedSearchResult(pub SearchResult);
 
 impl Ord for OrderedSearchResult {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -554,6 +554,17 @@ impl LayerMap {
 
     pub fn iter_historic_layers(&self) -> impl '_ + Iterator<Item = Arc<PersistentLayerDesc>> {
         self.historic.iter()
+    }
+
+    // TODO: all these clones are sus
+    pub fn iter_in_memory_layers(&self) -> impl '_ + Iterator<Item = Arc<InMemoryLayer>> {
+        match &self.open_layer {
+            Some(layer) => itertools::Either::Left(
+                std::iter::once(layer.clone())
+                    .chain(self.frozen_layers.iter().map(|fl| fl.clone()).rev()),
+            ),
+            None => itertools::Either::Right(self.frozen_layers.iter().map(|fl| fl.clone()).rev()),
+        }
     }
 
     ///

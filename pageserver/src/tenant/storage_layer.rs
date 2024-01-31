@@ -8,17 +8,22 @@ pub(crate) mod layer;
 mod layer_desc;
 
 use crate::context::{AccessStatsBehavior, RequestContext};
+use crate::repository::Value;
 use crate::task_mgr::TaskKind;
 use crate::walrecord::NeonWalRecord;
 use bytes::Bytes;
 use enum_map::EnumMap;
 use enumset::EnumSet;
 use once_cell::sync::Lazy;
+use pageserver_api::key::Key;
+use pageserver_api::keyspace::{KeySpace, KeySpaceAccum};
 use pageserver_api::models::{
     LayerAccessKind, LayerResidenceEvent, LayerResidenceEventReason, LayerResidenceStatus,
 };
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use utils::history_buffer::HistoryBufferWithDropCounter;
@@ -33,6 +38,11 @@ pub use inmemory_layer::InMemoryLayer;
 pub use layer_desc::{PersistentLayerDesc, PersistentLayerKey};
 
 pub(crate) use layer::{EvictionError, Layer, ResidentLayer};
+
+use self::layer::DownloadError;
+
+use super::timeline::GetVectoredError;
+use super::PageReconstructError;
 
 pub fn range_overlaps<T>(a: &Range<T>, b: &Range<T>) -> bool
 where
@@ -61,11 +71,156 @@ where
 /// the same ValueReconstructState struct in the next 'get_value_reconstruct_data'
 /// call, to collect more records.
 ///
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ValueReconstructState {
     pub records: Vec<(Lsn, NeonWalRecord)>,
     pub img: Option<(Lsn, Bytes)>,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ValureReconstructSituation {
+    Complete,
+    #[default]
+    Continue,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ValueReconstructStateTmp {
+    pub records: Vec<(Lsn, NeonWalRecord)>,
+    pub img: Option<(Lsn, Bytes)>,
+
+    cached_lsn: Option<Lsn>,
+    situation: ValureReconstructSituation,
+}
+
+pub struct ValuesReconstructState {
+    pub keys: HashMap<Key, Result<ValueReconstructStateTmp, PageReconstructError>>,
+    pub total_keys_done: usize,
+
+    keys_done: KeySpaceAccum,
+}
+
+impl ValuesReconstructState {
+    pub fn new() -> Self {
+        Self {
+            keys: HashMap::new(),
+            total_keys_done: 0,
+            keys_done: KeySpaceAccum::new(),
+        }
+    }
+
+    pub fn on_key_error(&mut self, key: Key, err: PageReconstructError) {
+        let previous = self.keys.insert(key, Err(err));
+        if let Some(Ok(state)) = previous {
+            if state.situation == ValureReconstructSituation::Continue {
+                self.total_keys_done += 1;
+                self.keys_done.add_key(key);
+            }
+        }
+    }
+
+    pub fn update_key(&mut self, key: &Key, lsn: Lsn, value: Value) -> bool {
+        let state = self
+            .keys
+            .entry(*key)
+            .or_insert(Ok(ValueReconstructStateTmp::default()));
+
+        if let Ok(state) = state {
+            let key_done = match state.situation {
+                ValureReconstructSituation::Complete => true,
+                ValureReconstructSituation::Continue => match value {
+                    Value::Image(img) => {
+                        state.img = Some((lsn, img));
+                        true
+                    }
+                    Value::WalRecord(rec) => {
+                        let reached_cache = state.cached_lsn.map(|clsn| clsn + 1) == Some(lsn);
+                        let will_init = rec.will_init();
+                        state.records.push((lsn, rec));
+                        will_init || reached_cache
+                    }
+                },
+            };
+
+            if key_done && state.situation == ValureReconstructSituation::Continue {
+                state.situation = ValureReconstructSituation::Complete;
+                self.total_keys_done += 1;
+                self.keys_done.add_key(*key);
+            }
+
+            key_done
+        } else {
+            true
+        }
+    }
+
+    pub fn get_cached_lsn(&self, key: &Key) -> Option<Lsn> {
+        self.keys
+            .get(key)
+            .and_then(|k| k.as_ref().ok())
+            .and_then(|state| state.cached_lsn)
+    }
+
+    pub fn consume_done_keys(&mut self) -> KeySpace {
+        self.keys_done.consume_keyspace()
+    }
+}
+
+#[derive(Debug)]
+pub enum ReadableLayer {
+    Persistent { layer: Layer, lsn_floor: Lsn },
+    InMemory(Arc<InMemoryLayer>),
+}
+
+impl ReadableLayer {
+    pub(super) fn get_lsn_floor(&self) -> Lsn {
+        match self {
+            ReadableLayer::Persistent { lsn_floor, .. } => *lsn_floor,
+            ReadableLayer::InMemory(l) => l.get_lsn_range().start,
+        }
+    }
+
+    pub async fn get_values_reconstruct_data(
+        &self,
+        keyspace: KeySpace,
+        end_lsn: Lsn,
+        reconstruct_state: &mut ValuesReconstructState,
+        ctx: &RequestContext,
+    ) -> Result<(), GetVectoredError> {
+        match self {
+            ReadableLayer::Persistent { layer, .. } => {
+                layer
+                    .get_values_reconstruct_data(keyspace, end_lsn, reconstruct_state, ctx)
+                    .await
+            }
+            ReadableLayer::InMemory(layer) => {
+                layer
+                    .get_values_reconstruct_data(keyspace, end_lsn, reconstruct_state, ctx)
+                    .await
+            }
+        }
+    }
+}
+
+impl Ord for ReadableLayer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.get_lsn_floor().cmp(&other.get_lsn_floor())
+    }
+}
+
+impl PartialOrd for ReadableLayer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ReadableLayer {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_lsn_floor() == other.get_lsn_floor()
+    }
+}
+
+impl Eq for ReadableLayer {}
 
 /// Return value from [`Layer::get_value_reconstruct_data`]
 #[derive(Clone, Copy, Debug)]
