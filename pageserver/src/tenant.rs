@@ -4893,7 +4893,7 @@ mod tests {
     // The test generates a keyspace by repeatedly flushing the in-memory layer and compacting.
     // Projected to 2D the key space looks like below. Lsn grows upwards on the Y axis and keys
     // grow to the right on the X axis.
-    //                       [Delta] 
+    //                       [Delta]
     //                 [Delta]
     //           [Delta]
     //    [Delta]

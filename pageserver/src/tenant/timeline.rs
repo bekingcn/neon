@@ -161,8 +161,8 @@ pub struct TimelineResources {
 
 #[derive(Debug, Default, Copy, Clone)]
 pub(crate) enum GetVectoredImpl {
-    #[default]
     Sequential,
+    #[default]
     Vectored,
 }
 
@@ -730,7 +730,35 @@ impl Timeline {
             GetVectoredImpl::Sequential => {
                 self.get_vectored_sequential_impl(keyspace, lsn, ctx).await
             }
-            GetVectoredImpl::Vectored => self.get_vectored_impl(keyspace, lsn, ctx).await,
+            GetVectoredImpl::Vectored => {
+                let vectored_res = self.get_vectored_impl(keyspace.clone(), lsn, ctx).await?;
+                let sequential_res = self
+                    .get_vectored_sequential_impl(keyspace, lsn, ctx)
+                    .await
+                    .unwrap();
+
+                vectored_res.iter().zip(sequential_res.iter()).for_each(
+                    |((seq_key, seq_res), (vec_key, vec_res))| {
+                        assert_eq!(seq_key, vec_key, "{} != {}", seq_key, vec_key);
+                        match (seq_res, vec_res) {
+                            (Ok(seq_blob), Ok(vec_blob)) => {
+                                assert_eq!(seq_blob, vec_blob, "Wrong image for key {}", seq_key)
+                            }
+                            _ => {
+                                error!(
+                                    "Unexpected error for key={}: seq_res={:?} vec_res={:?}",
+                                    seq_key,
+                                    seq_res.as_ref().map(|_| "Ok(...)"),
+                                    vec_res.as_ref().map(|_| "Ok(...)")
+                                );
+                                panic!()
+                            }
+                        }
+                    },
+                );
+
+                Ok(vectored_res)
+            }
         }
     }
 
@@ -2448,7 +2476,14 @@ impl Timeline {
             }
 
             // The function should have updated 'state'
-            info!("CALLED for {} at {}: {:?} with {} records, cached {}", key, cont_lsn, result, reconstruct_state.records.len(), cached_lsn);
+            info!(
+                "CALLED for {} at {}: {:?} with {} records, cached {}",
+                key,
+                cont_lsn,
+                result,
+                reconstruct_state.records.len(),
+                cached_lsn
+            );
             match result {
                 ValueReconstructResult::Complete => return Ok(traversal_path),
                 ValueReconstructResult::Continue => {
@@ -2638,6 +2673,7 @@ impl Timeline {
             // 6. Mark the ranges that previously mapped to this layer as unmapped
             // 7. Go back to 1
             let keys_done_last_step = reconstruct_state.consume_done_keys();
+            trace!("keys_done_last_step={keys_done_last_step:?}");
             unmapped_keyspace.remove_overlapping_with(&keys_done_last_step);
 
             if Lsn(cont_lsn.0 - 1) <= timeline.ancestor_lsn {
@@ -2674,8 +2710,16 @@ impl Timeline {
 
                         trace!(
                             "Range search for {:?} at {} returned {:?}",
-                            range, cont_lsn, results
+                            range,
+                            cont_lsn,
+                            results
                         );
+
+
+                        // TODO: matching_layers doesn't work. We need to update the keyspace
+                        // for each for each layer below instead. However, we still need to
+                        // pick the layer with the lowest lsn somehow.
+                        // Think about it tomorrow.
 
                         matching_layers.extend(results.found.into_iter().map(|(res, accum)| {
                             (
@@ -2695,10 +2739,13 @@ impl Timeline {
                 }
             }
 
+            trace!("matching_layers={matching_layers:?}");
+
             if let Some((layer_to_read, keyspace_to_read)) = matching_layers.pop_first() {
                 trace!(
                     "Handling layer {:?} for keyspace {:?}",
-                    layer_to_read, keyspace_to_read
+                    layer_to_read,
+                    keyspace_to_read
                 );
 
                 layer_to_read
@@ -2712,6 +2759,13 @@ impl Timeline {
 
                 unmapped_keyspace = keyspace_to_read;
                 cont_lsn = layer_to_read.get_lsn_floor();
+
+                trace!(
+                    "Handled layer {:?}. cont_lsn={}, unmapped_keyspace={:?}",
+                    layer_to_read,
+                    cont_lsn,
+                    unmapped_keyspace
+                );
             }
         }
 
