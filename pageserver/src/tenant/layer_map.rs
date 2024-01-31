@@ -153,6 +153,7 @@ pub struct SearchResult {
     pub lsn_floor: Lsn,
 }
 
+#[derive(Debug)]
 pub struct OrderedSearchResult(pub SearchResult);
 
 impl Ord for OrderedSearchResult {
@@ -175,6 +176,7 @@ impl PartialEq for OrderedSearchResult {
 
 impl Eq for OrderedSearchResult {}
 
+#[derive(Debug)]
 pub struct RangeSearchResult {
     pub found: BTreeMap<OrderedSearchResult, KeySpaceAccum>,
     pub not_found: KeySpaceAccum,
@@ -556,14 +558,12 @@ impl LayerMap {
         self.historic.iter()
     }
 
-    // TODO: all these clones are sus
     pub fn iter_in_memory_layers(&self) -> impl '_ + Iterator<Item = Arc<InMemoryLayer>> {
         match &self.open_layer {
             Some(layer) => itertools::Either::Left(
-                std::iter::once(layer.clone())
-                    .chain(self.frozen_layers.iter().map(|fl| fl.clone()).rev()),
+                std::iter::once(layer.clone()).chain(self.frozen_layers.iter().cloned().rev()),
             ),
-            None => itertools::Either::Right(self.frozen_layers.iter().map(|fl| fl.clone()).rev()),
+            None => itertools::Either::Right(self.frozen_layers.iter().cloned().rev()),
         }
     }
 
@@ -991,6 +991,43 @@ mod tests {
         let layer_map = create_layer_map(layers.clone());
         for start in 0..60 {
             for end in (start + 1)..60 {
+                let range = Key::from_i128(start)..Key::from_i128(end);
+                let result = layer_map.range_search(range.clone(), Lsn(100)).unwrap();
+                let expected = brute_force_range_search(&layer_map, range, Lsn(100));
+
+                assert_range_search_result_eq(result, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn ranged_search_compacted() {
+        let layers = vec![
+            LayerDesc {
+                key_range: Key::from_i128(0)..Key::from_i128(100),
+                lsn_range: Lsn(9)..Lsn(10),
+                is_delta: false,
+            },
+            LayerDesc {
+                key_range: Key::from_i128(10)..Key::from_i128(20),
+                lsn_range: Lsn(10)..Lsn(20),
+                is_delta: true,
+            },
+            LayerDesc {
+                key_range: Key::from_i128(20)..Key::from_i128(30),
+                lsn_range: Lsn(20)..Lsn(30),
+                is_delta: true,
+            },
+            LayerDesc {
+                key_range: Key::from_i128(30)..Key::from_i128(40),
+                lsn_range: Lsn(30)..Lsn(40),
+                is_delta: true,
+            },
+        ];
+
+        let layer_map = create_layer_map(layers.clone());
+        for start in 0..105 {
+            for end in (start + 1)..105 {
                 let range = Key::from_i128(start)..Key::from_i128(end);
                 let result = layer_map.range_search(range.clone(), Lsn(100)).unwrap();
                 let expected = brute_force_range_search(&layer_map, range, Lsn(100));

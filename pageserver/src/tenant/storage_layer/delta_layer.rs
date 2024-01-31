@@ -857,7 +857,7 @@ impl DeltaLayerInner {
 
                         if let Some(cached_lsn) = reconstruct_state.get_cached_lsn(&key) {
                             if entry_lsn <= cached_lsn {
-                                return !(key == range.start);
+                                return key != range.start;
                             }
                         }
 

@@ -159,6 +159,13 @@ pub struct TimelineResources {
     pub deletion_queue_client: DeletionQueueClient,
 }
 
+#[derive(Debug, Default, Copy, Clone)]
+pub(crate) enum GetVectoredImpl {
+    #[default]
+    Sequential,
+    Vectored,
+}
+
 pub struct Timeline {
     conf: &'static PageServerConf,
     tenant_conf: Arc<RwLock<AttachedTenantConf>>,
@@ -346,6 +353,8 @@ pub struct Timeline {
     ///
     /// Timeline deletion will acquire both compaction and gc locks in whatever order.
     gc_lock: tokio::sync::Mutex<()>,
+
+    get_vectored_impl: RwLock<GetVectoredImpl>,
 }
 
 pub struct WalReceiverInfo {
@@ -658,27 +667,25 @@ impl Timeline {
             .for_result(&res)
             .observe(elapsed.as_secs_f64());
 
-        if cfg!(feature = "testing") && res.is_err() {
-            // it can only be walredo issue
-            use std::fmt::Write;
+        use std::fmt::Write;
+        let mut msg = String::new();
 
-            let mut msg = String::new();
+        path.into_iter().for_each(|(res, cont_lsn, layer)| {
+            writeln!(
+                msg,
+                "- layer traversal: result {res:?}, cont_lsn {cont_lsn}, layer: {}",
+                layer(),
+            )
+            .expect("string grows")
+        });
 
-            path.into_iter().for_each(|(res, cont_lsn, layer)| {
-                writeln!(
-                    msg,
-                    "- layer traversal: result {res:?}, cont_lsn {cont_lsn}, layer: {}",
-                    layer(),
-                )
-                .expect("string grows")
-            });
-
-            // this is to rule out or provide evidence that we could in some cases read a duplicate
-            // walrecord
-            tracing::info!("walredo failed, path:\n{msg}");
-        }
+        info!("Path taken: {msg}");
 
         res
+    }
+
+    pub(crate) fn set_get_vectored_impl(&self, impl_type: GetVectoredImpl) {
+        *self.get_vectored_impl.write().unwrap() = impl_type;
     }
 
     pub(crate) const MAX_GET_VECTORED_KEYS: u64 = 32;
@@ -713,10 +720,68 @@ impl Timeline {
             }
         }
 
-        let mut reconstruct_state = ValuesReconstructState::new();
+        // TODO: update api above to take KeySpace
         let keyspace = KeySpace {
             ranges: Vec::from(key_ranges),
         };
+
+        let which = *self.get_vectored_impl.read().unwrap();
+        match which {
+            GetVectoredImpl::Sequential => {
+                self.get_vectored_sequential_impl(keyspace, lsn, ctx).await
+            }
+            GetVectoredImpl::Vectored => self.get_vectored_impl(keyspace, lsn, ctx).await,
+        }
+    }
+
+    async fn get_vectored_sequential_impl(
+        &self,
+        keyspace: KeySpace,
+        lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<BTreeMap<Key, Result<Bytes, PageReconstructError>>, GetVectoredError> {
+        trace!("get_vectored_sequential_impl range={keyspace:?}");
+
+        let mut values = BTreeMap::new();
+        for range in keyspace.ranges {
+            let mut key = range.start;
+            while key != range.end {
+                assert!(!self.shard_identity.is_key_disposable(&key));
+
+                let block = self.get(key, lsn, ctx).await;
+
+                if matches!(
+                    block,
+                    Err(PageReconstructError::Cancelled | PageReconstructError::AncestorStopping(_))
+                ) {
+                    return Err(GetVectoredError::Cancelled);
+                }
+
+                values.insert(key, block);
+                key = key.next();
+            }
+        }
+
+        Ok(values)
+    }
+
+    async fn get_vectored_impl(
+        &self,
+        keyspace: KeySpace,
+        lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<BTreeMap<Key, Result<Bytes, PageReconstructError>>, GetVectoredError> {
+        trace!("get_vectored_impl range={keyspace:?}");
+
+        for range in &keyspace.ranges {
+            let mut key = range.start;
+            while key != range.end {
+                assert!(!self.shard_identity.is_key_disposable(&key));
+                key = key.next();
+            }
+        }
+
+        let mut reconstruct_state = ValuesReconstructState::new();
 
         self.get_vectored_reconstruct_data(keyspace, lsn, &mut reconstruct_state, ctx)
             .await?;
@@ -1536,6 +1601,7 @@ impl Timeline {
 
                 compaction_lock: tokio::sync::Mutex::default(),
                 gc_lock: tokio::sync::Mutex::default(),
+                get_vectored_impl: RwLock::new(GetVectoredImpl::default()),
             };
             result.repartition_threshold =
                 result.get_checkpoint_distance() / REPARTITION_FREQ_IN_CHECKPOINT_DISTANCE;
@@ -2382,7 +2448,7 @@ impl Timeline {
             }
 
             // The function should have updated 'state'
-            //info!("CALLED for {} at {}: {:?} with {} records, cached {}", key, cont_lsn, result, reconstruct_state.records.len(), cached_lsn);
+            info!("CALLED for {} at {}: {:?} with {} records, cached {}", key, cont_lsn, result, reconstruct_state.records.len(), cached_lsn);
             match result {
                 ValueReconstructResult::Complete => return Ok(traversal_path),
                 ValueReconstructResult::Continue => {
@@ -2444,7 +2510,7 @@ impl Timeline {
             if let Some(open_layer) = &layers.open_layer {
                 let start_lsn = open_layer.get_lsn_range().start;
                 if cont_lsn > start_lsn {
-                    //info!("CHECKING for {} at {} on open layer {}", key, cont_lsn, open_layer.filename().display());
+                    // info!("CHECKING for {} at {} on open layer {}", key, cont_lsn, open_layer.filename().display());
                     // Get all the data needed to reconstruct the page version from this layer.
                     // But if we have an older cached page image, no need to go past that.
                     let lsn_floor = max(cached_lsn + 1, start_lsn);
@@ -2477,6 +2543,7 @@ impl Timeline {
                 let start_lsn = frozen_layer.get_lsn_range().start;
                 if cont_lsn > start_lsn {
                     //info!("CHECKING for {} at {} on frozen layer {}", key, cont_lsn, frozen_layer.filename().display());
+                    //how
                     let lsn_floor = max(cached_lsn + 1, start_lsn);
                     result = match frozen_layer
                         .get_value_reconstruct_data(
@@ -2580,7 +2647,7 @@ impl Timeline {
                     cont_lsn
                 );
 
-                timeline_owned = self
+                timeline_owned = timeline
                     .get_ready_ancestor_timeline(ctx)
                     .await
                     .map_err(GetVectoredError::GetReadyAncestorError)?;
@@ -2601,12 +2668,15 @@ impl Timeline {
                 }
                 None => {
                     for range in unmapped_keyspace.ranges.iter() {
-                        let results = layers.range_search(range.clone(), cont_lsn);
-                        if results.is_none() {
-                            return Err(GetVectoredError::InvalidLsn(cont_lsn));
-                        }
+                        let results = layers
+                            .range_search(range.clone(), cont_lsn)
+                            .ok_or_else(|| GetVectoredError::InvalidLsn(cont_lsn))?;
 
-                        let results = results.unwrap();
+                        trace!(
+                            "Range search for {:?} at {} returned {:?}",
+                            range, cont_lsn, results
+                        );
+
                         matching_layers.extend(results.found.into_iter().map(|(res, accum)| {
                             (
                                 ReadableLayer::Persistent {
@@ -2626,6 +2696,11 @@ impl Timeline {
             }
 
             if let Some((layer_to_read, keyspace_to_read)) = matching_layers.pop_first() {
+                trace!(
+                    "Handling layer {:?} for keyspace {:?}",
+                    layer_to_read, keyspace_to_read
+                );
+
                 layer_to_read
                     .get_values_reconstruct_data(
                         keyspace_to_read.clone(),

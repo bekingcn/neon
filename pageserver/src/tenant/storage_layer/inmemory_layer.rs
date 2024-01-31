@@ -71,27 +71,11 @@ pub struct InMemoryLayerInner {
     file: EphemeralFile,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
 struct BlockRead {
     key: Key,
     lsn: Lsn,
     block_offset: u64,
-}
-
-impl Ord for BlockRead {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.lsn.cmp(&other.lsn) {
-            Ordering::Equal => self.block_offset.cmp(&other.block_offset),
-            Ordering::Less => Ordering::Less,
-            Ordering::Greater => Ordering::Greater,
-        }
-    }
-}
-
-impl PartialOrd for BlockRead {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl std::fmt::Debug for InMemoryLayerInner {
@@ -298,8 +282,11 @@ impl InMemoryLayer {
                 continue;
             }
 
-            let key_done =
-                reconstruct_state.update_key(&block_read.0.key, block_read.0.lsn, value.unwrap());
+            let key_done = reconstruct_state.update_key(
+                dbg!(&block_read.0.key),
+                block_read.0.lsn,
+                value.unwrap(),
+            );
             if key_done {
                 completed_keys.insert(block_read.0.key);
             }
