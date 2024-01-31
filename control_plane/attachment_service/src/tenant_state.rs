@@ -33,8 +33,11 @@ pub(crate) struct TenantState {
     pub(crate) sequence: Sequence,
 
     // Latest generation number: next time we attach, increment this
-    // and use the incremented number when attaching
-    pub(crate) generation: Generation,
+    // and use the incremented number when attaching.
+    //
+    // None represents an incompletely onboarded tenant via the [`Service::location_config`]
+    // API, where this tenant may only run in PlacementPolicy::Secondary.
+    pub(crate) generation: Option<Generation>,
 
     // High level description of how the tenant should be set up.  Provided
     // externally.
@@ -162,7 +165,7 @@ pub(crate) struct ReconcileResult {
     pub(crate) result: Result<(), ReconcileError>,
 
     pub(crate) tenant_shard_id: TenantShardId,
-    pub(crate) generation: Generation,
+    pub(crate) generation: Option<Generation>,
     pub(crate) observed: ObservedState,
 }
 
@@ -217,7 +220,7 @@ impl TenantState {
             tenant_shard_id,
             policy,
             intent: IntentState::default(),
-            generation: Generation::new(0),
+            generation: Some(Generation::new(0)),
             shard,
             observed: ObservedState::default(),
             config: TenantConfig::default(),
@@ -373,7 +376,12 @@ impl TenantState {
 
     fn dirty(&self) -> bool {
         if let Some(node_id) = self.intent.attached {
-            let wanted_conf = attached_location_conf(self.generation, &self.shard, &self.config);
+            // Maybe panic: it is a severe bug if we try to attach while generation is null.
+            let generation = self
+                .generation
+                .expect("Attempted to enter attached state without a generation");
+
+            let wanted_conf = attached_location_conf(generation, &self.shard, &self.config);
             match self.observed.locations.get(&node_id) {
                 Some(conf) if conf.conf.as_ref() == Some(&wanted_conf) => {}
                 Some(_) | None => {

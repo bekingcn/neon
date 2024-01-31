@@ -284,15 +284,15 @@ impl Service {
             // We will populate intent properly later in [`Self::startup_reconcile`], initially populate
             // it with what we can infer: the node for which a generation was most recently issued.
             let mut intent = IntentState::new();
-            if tsp.generation_pageserver != i64::MAX {
-                intent.attached = Some(NodeId(tsp.generation_pageserver as u64))
+            if let Some(generation_pageserver) = tsp.generation_pageserver {
+                intent.attached = Some(NodeId(generation_pageserver as u64))
             }
 
             let new_tenant = TenantState {
                 tenant_shard_id,
                 shard: shard_identity,
                 sequence: Sequence::initial(),
-                generation: Generation::new(tsp.generation as u32),
+                generation: tsp.generation.map(|g| Generation::new(g as u32)),
                 policy: serde_json::from_str(&tsp.placement_policy).unwrap(),
                 intent,
                 observed: ObservedState::new(),
@@ -400,8 +400,8 @@ impl Service {
                 shard_number: attach_req.tenant_shard_id.shard_number.0 as i32,
                 shard_count: attach_req.tenant_shard_id.shard_count.0 as i32,
                 shard_stripe_size: 0,
-                generation: 0,
-                generation_pageserver: i64::MAX,
+                generation: Some(0),
+                generation_pageserver: None,
                 placement_policy: serde_json::to_string(&PlacementPolicy::default()).unwrap(),
                 config: serde_json::to_string(&TenantConfig::default()).unwrap(),
             };
@@ -454,7 +454,7 @@ impl Service {
             .expect("Checked for existence above");
 
         if let Some(new_generation) = new_generation {
-            tenant_state.generation = new_generation;
+            tenant_state.generation = Some(new_generation);
         } else {
             // This is a detach notification.  We must update placement policy to avoid re-attaching
             // during background scheduling/reconciliation, or during attachment service restart.
@@ -494,7 +494,7 @@ impl Service {
         Ok(AttachHookResponse {
             gen: attach_req
                 .node_id
-                .map(|_| tenant_state.generation.into().unwrap()),
+                .map(|_| tenant_state.generation.expect("Test hook, not used on tenants that are mid-onboarding with a NULL generation").into().unwrap()),
         })
     }
 
@@ -507,7 +507,7 @@ impl Service {
             attachment: tenant_state.and_then(|s| {
                 s.intent
                     .attached
-                    .map(|ps| (s.generation.into().unwrap(), ps))
+                    .map(|ps| (s.generation.expect("Test hook, not used on tenants that are mid-onboarding with a NULL generation").into().unwrap(), ps))
             }),
         }
     }
@@ -548,7 +548,12 @@ impl Service {
                 continue;
             };
 
-            shard_state.generation = std::cmp::max(shard_state.generation, new_gen);
+            let Some(old_gen) = shard_state.generation else {
+                // Should never happen: [`Persistence::re_attach`] would only return incremented generation
+                // for a tenant that already had a non-null generation.
+                anyhow::bail!("Generation must be set while re-attaching");
+            };
+            shard_state.generation = Some(std::cmp::max(old_gen, new_gen));
 
             // TODO: cancel/restart any running reconciliation for this tenant, it might be trying
             // to call location_conf API with an old generation.  Wait for cancellation to complete
@@ -569,7 +574,7 @@ impl Service {
 
         for req_tenant in validate_req.tenants {
             if let Some(tenant_state) = locked.tenants.get(&req_tenant.id) {
-                let valid = tenant_state.generation == Generation::new(req_tenant.gen);
+                let valid = tenant_state.generation == Some(Generation::new(req_tenant.gen));
                 tracing::info!(
                     "handle_validate: {}(gen {}): valid={valid} (latest {:?})",
                     req_tenant.id,
@@ -629,6 +634,28 @@ impl Service {
             })
             .collect::<Vec<_>>();
 
+        // If the caller specifies a None generation, it means "start from default".  This is different
+        // to [`Self::tenant_location_config`], where a None generation is used to represent
+        // an incompletely-onboarded tenant.
+        let initial_generation = if matches!(placement_policy, PlacementPolicy::Secondary) {
+            tracing::info!(
+                "tenant_create: secondary mode, generation is_some={}",
+                create_req.generation.is_some()
+            );
+            create_req.generation.map(Generation::new)
+        } else {
+            tracing::info!(
+                "tenant_create: not secondary mode, generation is_some={}",
+                create_req.generation.is_some()
+            );
+            Some(
+                create_req
+                    .generation
+                    .map(Generation::new)
+                    .unwrap_or(INITIAL_GENERATION),
+            )
+        };
+
         // Ordering: we persist tenant shards before creating them on the pageserver.  This enables a caller
         // to clean up after themselves by issuing a tenant deletion if something goes wrong and we restart
         // during the creation, rather than risking leaving orphan objects in S3.
@@ -639,11 +666,10 @@ impl Service {
                 shard_number: tenant_shard_id.shard_number.0 as i32,
                 shard_count: tenant_shard_id.shard_count.0 as i32,
                 shard_stripe_size: create_req.shard_parameters.stripe_size.0 as i32,
-                generation: create_req
-                    .generation
-                    .map(|g| g as i32)
-                    .unwrap_or(INITIAL_GENERATION.into().unwrap() as i32),
-                generation_pageserver: i64::MAX,
+                generation: initial_generation.map(|g| g.into().unwrap() as i32),
+                // The pageserver is not known until scheduling happens: we will set this column when
+                // incrementing the generation the first time we attach to a pageserver.
+                generation_pageserver: None,
                 placement_policy: serde_json::to_string(&placement_policy).unwrap(),
                 config: serde_json::to_string(&create_req.config).unwrap(),
             })
@@ -683,15 +709,17 @@ impl Service {
                             ))
                         })?;
 
-                        response_shards.push(TenantCreateResponseShard {
-                            shard_id: tenant_shard_id,
-                            node_id: entry
+                        if let Some(node_id) = entry.get().intent.attached {
+                            let generation = entry
                                 .get()
-                                .intent
-                                .attached
-                                .expect("We just set pageserver if it was None"),
-                            generation: entry.get().generation.into().unwrap(),
-                        });
+                                .generation
+                                .expect("Generation is set when in attached mode");
+                            response_shards.push(TenantCreateResponseShard {
+                                shard_id: tenant_shard_id,
+                                node_id,
+                                generation: generation.into().unwrap(),
+                            });
+                        }
 
                         continue;
                     }
@@ -705,9 +733,7 @@ impl Service {
                             placement_policy.clone(),
                         );
 
-                        if let Some(create_gen) = create_req.generation {
-                            state.generation = Generation::new(create_gen);
-                        }
+                        state.generation = initial_generation;
                         state.config = create_req.config.clone();
 
                         state.schedule(&mut scheduler).map_err(|e| {
@@ -719,10 +745,13 @@ impl Service {
                         // Only include shards in result if we are attaching: the purpose
                         // of the response is to tell the caller where the shards are attached.
                         if let Some(node_id) = state.intent.attached {
+                            let generation = state
+                                .generation
+                                .expect("Generation is set when in attached mode");
                             response_shards.push(TenantCreateResponseShard {
                                 shard_id: tenant_shard_id,
                                 node_id,
-                                generation: state.generation.into().unwrap(),
+                                generation: generation.into().unwrap(),
                             });
                         }
 
@@ -842,7 +871,8 @@ impl Service {
                 // once a tenant is created in this service, our view of generation is authoritative, and
                 // callers' generations may be ignored.  This represents a one-way migration of tenants from the outer
                 // cloud control plane into this service.
-                let set_generation = if shard.generation == INITIAL_GENERATION {
+
+                let set_generation = if shard.generation.is_none() {
                     // Requests don't ordinarily specify generation in secondary, but if it is provided respect it
                     req.config.generation.map(Generation::new)
                 } else {
@@ -868,11 +898,7 @@ impl Service {
                     (
                         TenantCreateRequest {
                             new_tenant_id: TenantShardId::unsharded(tenant_id),
-                            generation: Some(
-                                req.config
-                                    .generation
-                                    .unwrap_or(INITIAL_GENERATION.into().unwrap()),
-                            ),
+                            generation: req.config.generation,
                             shard_parameters: ShardParameters {
                                 // Must preserve the incoming shard_count do distinguish unsharded (0)
                                 // from single-sharded (1): this distinction appears in the S3 keys of the tenant.
@@ -937,7 +963,7 @@ impl Service {
                         shard.policy = placement_policy;
                         shard.config = config;
                         if let Some(generation) = maybe_generation {
-                            shard.generation = generation;
+                            shard.generation = Some(generation);
                         }
 
                         shard.schedule(&mut scheduler)?;
