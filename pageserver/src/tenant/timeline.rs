@@ -2430,7 +2430,7 @@ impl Timeline {
                     cont_lsn
                 );
 
-                timeline_owned = self.get_ready_ancestor_timeline(ctx).await?;
+                timeline_owned = timeline.get_ready_ancestor_timeline(ctx).await?;
                 timeline = &*timeline_owned;
                 prev_lsn = Lsn(u64::MAX);
                 continue 'outer;
